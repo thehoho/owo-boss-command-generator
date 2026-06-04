@@ -224,9 +224,7 @@ def parse_boss(block):
 
         if key in PASSIVE_MAP:
             short = PASSIVE_MAP[key]
-
-            if short not in passives:
-                passives.append(short)
+            passives.append(short)
 
     passive_text = " " + " ".join(passives) if passives else ""
 
