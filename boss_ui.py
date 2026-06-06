@@ -1654,6 +1654,19 @@ try:
     if os.path.exists(ip):
         root.iconbitmap(ip)
         root.wm_iconbitmap(ip)
+        # Force Windows taskbar + title-bar icon via ctypes (works in .exe too)
+        try:
+            from ctypes import windll
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+            ico  = ctypes.windll.user32.LoadImageW(
+                0, ip, 1, 0, 0, 0x00000010 | 0x00000040  # LR_LOADFROMFILE | LR_DEFAULTSIZE
+            )
+            if ico:
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, ico)  # WM_SETICON ICON_BIG
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, ico)  # WM_SETICON ICON_SMALL
+        except Exception:
+            pass
 except Exception:
     pass
 
