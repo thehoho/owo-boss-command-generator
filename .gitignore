@@ -1,0 +1,10 @@
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+*.zip
+
+# Do not commit bundled Tesseract to source.
+# It is included only in GitHub Release ZIP files.
+vendor/
