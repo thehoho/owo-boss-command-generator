@@ -1,5 +1,5 @@
 # ============================================================
-# boss_ui.py  –  OwO Boss Command Generator  v0.6-portable
+# boss_ui.py  –  OwO Boss Command Generator  v0.7-desktop
 # Modes: Text Mode (paste wboss output) + Image Mode (screenshot scan)
 # Made by Hassaan
 # ============================================================
@@ -130,7 +130,31 @@ ANIMALS = [
     "squid","boar","eagle","frog","gorilla","wolf",
 ]
 RARITIES = ["Common","Uncommon","Rare","Epic","Legendary","Mythical","Divine","Fabled"]
-PASSIVE_CMD_OVERRIDES = {"sprt": "sprout"}
+WEAPON_CMD_OVERRIDES = {
+    # Template/file stem -> command shortcut
+    "bleeding_gaze": "bgaz",
+    "gaze": "bgaz",
+    "claw": "cclaw",
+    "conduit_claw": "cclaw",
+    "edge": "aedge",
+    "arbiter_edge": "aedge",
+    "arbiter_s_edge": "aedge",
+    "scepter": "ascept",
+    "arcane": "ascept",
+    "arcane_scepter": "ascept",
+    "culling_scythe": "sythe",
+    "scythe": "sythe",
+    "wbow": "xbow",
+    "crossbow": "xbow",
+    "wounding_crossbow": "xbow",
+}
+PASSIVE_CMD_OVERRIDES = {
+    "sprt": "sprout",
+    "enra": "enrage",
+    "slay": "gslay",
+    "reso": "res",
+    "n": "kno",
+}
 RUNE_WEAPONS = {"rune"}
 ORB_WEAPONS  = {"orb"}
 
@@ -140,7 +164,10 @@ def passive_slots(weapon):
     return 2
 
 def to_cmd_name(stem, is_passive):
-    return PASSIVE_CMD_OVERRIDES.get(stem, stem) if is_passive else stem
+    stem = (stem or "").strip().lower()
+    if is_passive:
+        return PASSIVE_CMD_OVERRIDES.get(stem, stem)
+    return WEAPON_CMD_OVERRIDES.get(stem, stem)
 
 # ─── Icon cache (loaded once at startup) ─────────────────────
 _icon_cache: dict = {"weapons": {}, "passives": {}}  # stem -> PhotoImage
@@ -770,10 +797,47 @@ def _fuzzy_match(text, choices, threshold=65):
 def _fuzzy_animal(text):
     best_s, best = 0, None
     for w in re.findall(r"[A-Za-z]+", text.lower()):
-        if len(w) < 3: continue
+        if len(w) < 3:
+            continue
         r = fuzz_process.extractOne(w, ANIMALS, scorer=_fuzz.ratio, score_cutoff=60)
-        if r and r[1] > best_s: best_s, best = r[1], r[0]
+        if r and r[1] > best_s:
+            best_s, best = r[1], r[0]
     return best
+
+def _animal_from_title_text(raw_text, fallback_text=""):
+    """
+    Prefer the literal animal name after the rarity instead of forcing a fixed
+    animal list. This lets event/new animals work in Image Mode too:
+    'Lvl 50 Rare New Animal' -> 'new_animal'.
+    """
+    raw_text = raw_text or ""
+    cleaned = normalize_name(raw_text)
+    tokens = cleaned.split()
+
+    rarity_words = {
+        "common", "uncommon", "rare", "epic", "legendary",
+        "mythical", "mythic", "divine", "fabled",
+        "special", "hidden", "patreon", "gem", "bot", "distorted",
+    }
+    skip_words = {"lvl", "lv", "level"}
+
+    for i, tok in enumerate(tokens):
+        if tok in rarity_words:
+            cand = []
+            for nxt in tokens[i+1:]:
+                if nxt in skip_words or nxt in rarity_words:
+                    continue
+                if nxt.isdigit():
+                    continue
+                # Stop if OCR accidentally pulled HP/stat words.
+                if nxt in {"hp", "wp", "att", "str", "mag", "mr", "pr"}:
+                    break
+                cand.append(nxt)
+            if cand:
+                return "_".join(cand[:3])
+
+    # Fallback to the old known-animal fuzzy match.
+    return _fuzzy_animal(fallback_text or raw_text)
 
 def _extract_title(rgba_card, white):
     h, w  = rgba_card.shape[:2]
@@ -815,7 +879,7 @@ def _extract_title(rgba_card, white):
         level = _parse_level(raw)
         level = _correct_level_1_7_dark(level, rgba_card)
 
-    return level, _fuzzy_match(raw, RARITIES, 65), _fuzzy_animal(raw)
+    return level, _fuzzy_match(raw, RARITIES, 65), _animal_from_title_text(raw, raw)
 
 def _load_templates(folder):
     out = {}
@@ -926,7 +990,7 @@ def process_image(path, assets_dir=None):
         w_roi, _ = _card_rois(ch, white, n_passives=2)
         w_bgr    = _get_bgr(rgba_card, w_roi, brighten=dead)
         w_hits   = _nms(_find_matches(w_bgr, weapons, wt, SIZES_WEAPON, max_hits=1), max_items=1)
-        weapon_name = w_hits[0]["name"] if w_hits else ""
+        weapon_name = to_cmd_name(w_hits[0]["name"], False) if w_hits else ""
 
         n_pass   = passive_slots(weapon_name)
         _, p_roi = _card_rois(ch, white, n_passives=n_pass)
@@ -1050,7 +1114,271 @@ def split_boss_blocks(text):
         blocks.append(text[m.start():end].strip())
     return blocks
 
-def parse_boss(block):
+
+# ─── Exact Text Mode parser ( Pencilvester logic) ─────
+# This keeps the desktop Text Mode aligned with the mobile app:
+# copied wboss i text -> exact Neon blueprint stats. If exact parsing fails,
+# the app falls back to the older QE parser instead of blocking the user.
+
+EXACT_WEAR_MULTIPLIER = {
+    "WORN": 1,
+    "DECENT": 1.01,
+    "FINE": 1.03,
+    "PRISTINE": 1.05,
+}
+
+EXACT_MODIFIER_WORDS = {
+    "Worn", "Decent", "Fine", "Pristine",
+    "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Mythical",
+    "Divine", "Fabled", "Empowered", "Shiny", "Boss",
+}
+
+EXACT_WEAPONS = {
+    "Great Sword": {"values": [[35, 55], [200, 100]], "alias": "sword"},
+    "Healing Staff": {"values": [[110, 160], [225, 150]], "alias": "hstaff"},
+    "Bow": {"values": [[110, 160], [220, 120]], "alias": "bow"},
+    "Rune of the Forgotten": {"values": [[5, 15]], "alias": "rune"},
+    "Defender's Aegis": {"values": [[30, 50], [250, 150]], "alias": "shield"},
+    "Orb of Potency": {"values": [], "alias": "orb"},
+    "Vampiric Staff": {"values": [[25, 45], [190, 90]], "alias": "vstaff"},
+    "Poison Dagger": {"values": [[70, 100], [30, 50], [200, 100]], "alias": "pd"},
+    "Wand of Absorption": {"values": [[80, 115], [20, 40], [250, 150]], "alias": "wand"},
+    "Flame Staff": {"values": [[75, 95], [20, 40], [70, 100], [200, 100]], "alias": "fstaff"},
+    "Energy Staff": {"values": [[35, 65], [200, 100]], "alias": "estaff"},
+    "Spirit Staff": {"values": [[30, 50], [20, 30], [250, 150]], "alias": "sstaff"},
+    "Arcane Scepter": {"values": [[65, 95], [200, 125]], "alias": "ascept"},
+    "Resurrection Staff": {"values": [[60, 90], [400, 300]], "alias": "rstaff"},
+    "Glacial Axe": {"values": [[40, 60], [260, 160]], "alias": "axe"},
+    "Vanguard's Banner": {"values": [[15, 25], [25, 35], [40, 50], [290, 235]], "alias": "vban"},
+    "Culling Scythe": {"values": [[70, 100], [45, 75], [200, 100]], "alias": "sythe"},
+    "Rune of Celebration": {"values": [[20, 45], [15, 35], [200, 100]], "alias": "crune"},
+    "Staff of Purity": {"values": [[50, 100], [15, 25], [250, 150]], "alias": "pstaff"},
+    "Leeching Scythe": {"values": [[50, 80], [40, 60], [30, 60], [30, 60], [230, 130]], "alias": "lsy"},
+    "Foul Fish": {"values": [[50, 80], [20, 50], [280, 180]], "alias": "ffish"},
+    "Rune of Luck": {"values": [[1, 40], [1, 40], [1, 40], [1, 40], [1, 40], [200, 100]], "alias": "lrune"},
+    "Staff of Corruption": {"values": [[70, 50], [80, 120], [250, 150]], "alias": "cstaff"},
+    "Soul Tithe": {"values": [[10, 25], [0.35, 0.45], [100, 50]], "alias": "soul"},
+    "Briar-Heart Staff": {"values": [[25, 50], [20, 30], [20, 30], [240, 140]], "alias": "bhstaff"},
+    "Arbiter's Edge": {"values": [[10, 20], [20, 30], [225, 125]], "alias": "aedge"},
+    "Wounding Crossbow": {"values": [[220, 300], [10, 25], [480, 280]], "alias": "xbow"},
+    "Bleeding Gaze": {"values": [[20, 10], [30, 50], [20, 40], [150, 200]], "alias": "bgaz"},
+    "Conduit Claw": {"values": [[20, 50], [120, 170], [200, 100]], "alias": "cclaw"},
+}
+
+EXACT_PASSIVES = {
+    "Strength": {"values": [[5, 20]], "alias": "str"},
+    "Magic": {"values": [[5, 20]], "alias": "mag"},
+    "Health Point": {"values": [[5, 20]], "alias": "hp"},
+    "Weapon Point": {"values": [[10, 30]], "alias": "wp"},
+    "Physical Resistance": {"values": [[15, 35]], "alias": "pr"},
+    "Magical Resistance": {"values": [[15, 35]], "alias": "mr"},
+    "Magic Resistance": {"values": [[15, 35]], "alias": "mr"},
+    "Lifesteal": {"values": [[15, 35]], "alias": "ls"},
+    "Thorns": {"values": [[15, 35]], "alias": "th"},
+    "Mana Tap": {"values": [[15, 30]], "alias": "mtap"},
+    "Absolve": {"values": [[60, 80]], "alias": "absv"},
+    "Safeguard": {"values": [[20, 40]], "alias": "sg"},
+    "Critical": {"values": [[10, 30], [25, 50]], "alias": "crit"},
+    "Discharge": {"values": [[110, 150]], "alias": "dc"},
+    "Kamikaze": {"values": [[50, 75]], "alias": "kk"},
+    "Regeneration": {"values": [[5, 10]], "alias": "hgen"},
+    "Energize": {"values": [[20, 40]], "alias": "wgen"},
+    "Sprout": {"values": [[20, 40]], "alias": "sprout"},
+    "Enrage": {"values": [[2, 5]], "alias": "enrage"},
+    "Snail": {"values": [[5, 15]], "alias": "snail"},
+    "Sacrifice": {"values": [[25, 50], [15, 35]], "alias": "sac"},
+    "Knowledge": {"values": [[5, 15]], "alias": "kno"},
+    "Giant Slayer": {"values": [[10, 25]], "alias": "gslay"},
+    "Adaptation": {"values": [[5, 10], [5, 10]], "alias": "adapt"},
+    "Resonance": {"values": [[5, 10], [5, 10]], "alias": "res"},
+    "Living Hive": {"values": [[8, 2], [2, 8]], "alias": "swarm"},
+    "Lone Wolf": {"values": [[10, 30], [10, 30]], "alias": "lwolf"},
+    "Double Strike": {"values": [[10, 25], [15, 30], [35, 20]], "alias": "ds"},
+    "Frost Armor": {"values": [[10, 20]], "alias": "fr"},
+}
+
+_EXACT_WEAPON_BY_NORM = {normalize_name(k): k for k in EXACT_WEAPONS}
+_EXACT_PASSIVE_BY_NORM = {normalize_name(k): k for k in EXACT_PASSIVES}
+
+def _exact_number_values(section):
+    """
+    Extract numbers from bold Discord stat values.
+    Handles:
+    **41%**, **+41%**, +**9.8%**, -**31.2%**, **0.45**
+    We return absolute values because some descriptions use -**x%** wording,
+    while the blueprint stat ranges use the magnitude.
+    """
+    vals = []
+    # Strip emoji tags so regex context is cleaner.
+    section = re.sub(r"<:[^>]+>", " ", section)
+
+    patterns = [
+        r"[-+]?\s*\*\*\s*[-+]?\s*(\d+(?:\.\d+)?)\s*%?\s*\*\*",
+        r"\*\*\s*[-+]?\s*(\d+(?:\.\d+)?)\s*%?\s*\*\*",
+    ]
+    seen_spans = []
+    for pat in patterns:
+        for m in re.finditer(pat, section):
+            span = m.span()
+            if any(not (span[1] <= s[0] or span[0] >= s[1]) for s in seen_spans):
+                continue
+            vals.append(float(m.group(1)))
+            seen_spans.append(span)
+    return vals
+
+def _extract_exact_weapon_type(header):
+    words = header.strip().split()
+    while words and words[0] in EXACT_MODIFIER_WORDS:
+        words.pop(0)
+    candidate = " ".join(words).strip()
+    norm = normalize_name(candidate)
+    key = _EXACT_WEAPON_BY_NORM.get(norm)
+    if key:
+        return key
+    # Also try after removing leftover modifier/rarity words.
+    words = [w for w in normalize_name(candidate).split()
+             if w not in RARITIES_SET and w not in {x.lower() for x in EXACT_MODIFIER_WORDS}]
+    norm2 = " ".join(words)
+    key = _EXACT_WEAPON_BY_NORM.get(norm2)
+    if key:
+        return key
+    raise ValueError(f"Unknown exact weapon: {candidate or header}")
+
+def _extract_exact_animal(block):
+    compact = " ".join(block.split())
+    m = re.search(r"##\s*Lvl\s*(\d+)\s+(.+?)(?=<:|###|-#|\*\*|$)", compact, re.I)
+    if not m:
+        raise ValueError("Could not find exact boss level/name.")
+    level = m.group(1)
+    title_words = m.group(2).strip().split()
+    # Remove the first rarity/modifier word only, then keep unknown/event names.
+    while title_words and normalize_name(title_words[0]) in RARITIES_SET:
+        title_words.pop(0)
+    animal = "_".join(normalize_name(" ".join(title_words)).split()) or "unknown"
+    return f"{level} {animal}"
+
+def _exact_rarity_from_raw(value, low, high, wear):
+    return round(100 * ((value - low) / (high - low) - EXACT_WEAR_MULTIPLIER[wear] + 1))
+
+def _exact_convert_values(wear, weapon_type, passive_types, w_values, p_values):
+    if wear not in EXACT_WEAR_MULTIPLIER:
+        raise ValueError(f"Unknown wear: {wear}")
+
+    weapon_ranges = EXACT_WEAPONS[weapon_type]["values"]
+    if len(w_values) != len(weapon_ranges):
+        raise ValueError(
+            f"{weapon_type} requires exactly {len(weapon_ranges)} stats. "
+            f"You provided {len(w_values)} stats: {w_values}"
+        )
+
+    w_rarities = [
+        _exact_rarity_from_raw(float(value), low, high, wear)
+        for value, (low, high) in zip(w_values, weapon_ranges)
+    ]
+
+    p_rarities = []
+    for passive_type, values in zip(passive_types, p_values):
+        ranges = EXACT_PASSIVES[passive_type]["values"]
+
+        # Living Hive values are complementary in the current OwO formula.
+        if passive_type == "Living Hive" and len(values) == 1:
+            values = [values[0], round(10 - values[0], 2)]
+
+        if len(values) != len(ranges):
+            raise ValueError(
+                f"{passive_type} requires exactly {len(ranges)} stats. "
+                f"You provided {len(values)} stats: {values}"
+            )
+
+        p_rarities.append([
+            _exact_rarity_from_raw(float(value), low, high, wear)
+            for value, (low, high) in zip(values, ranges)
+        ])
+
+    return w_rarities, p_rarities
+
+def _parse_boss_exact(block):
+    text = block.strip()
+    compact = " ".join(text.split())
+
+    wear_m = re.search(r"\*\*Wear:\*\*\s*`?(\w+)`?", compact, re.I)
+    if not wear_m:
+        raise ValueError("Exact parser could not find Wear.")
+    wear = wear_m.group(1).upper()
+
+    animal = _extract_exact_animal(text)
+
+    header_m = re.search(
+        r"###\s*(.*?)(?=\*\*Quality:\*\*|\*\*Wear:\*\*|\*\*Type:\*\*|\*\*Weapon Cost:\*\*|###\s+__Description__|$)",
+        compact,
+        re.I,
+    )
+    if not header_m:
+        raise ValueError("Exact parser could not find weapon header.")
+
+    weapon_type = _extract_exact_weapon_type(header_m.group(1))
+
+    # Find real passive blocks only. Effect/status blocks are kept inside the
+    # previous passive section, so Adaptation/Living Hive/Frost Armor still work.
+    all_title_blocks = list(re.finditer(r"\*\*__(.*?)__\*\*", compact))
+    real_passive_blocks = []
+    for m in all_title_blocks:
+        norm = normalize_name(m.group(1).strip())
+        if norm in _EXACT_PASSIVE_BY_NORM:
+            real_passive_blocks.append((m, _EXACT_PASSIVE_BY_NORM[norm]))
+
+    first_real_passive = real_passive_blocks[0][0] if real_passive_blocks else None
+    weapon_section = compact[:first_real_passive.start()] if first_real_passive else compact
+
+    wp_cost = None
+    if weapon_type not in {"Orb of Potency", "Rune of the Forgotten"}:
+        wp_m = re.search(r"\*\*Weapon Cost:\*\*\s*(\d+(?:\.\d+)?)", weapon_section, re.I)
+        if not wp_m:
+            raise ValueError(f"Exact parser could not find Weapon Cost for {weapon_type}.")
+        wp_cost = float(wp_m.group(1))
+
+    weapon_values = _exact_number_values(weapon_section)
+
+    # Remove quality value if it ever appears in the captured list.
+    q_m = re.search(r"\*\*Quality:\*\*.*?(\d+(?:\.\d+)?)%", weapon_section, re.I)
+    if q_m and weapon_values and abs(weapon_values[0] - float(q_m.group(1))) < 0.0001:
+        weapon_values.pop(0)
+
+    if weapon_type == "Bleeding Gaze":
+        w_values = [wp_cost] + weapon_values
+    elif weapon_type == "Orb of Potency":
+        w_values = []
+    elif weapon_type == "Rune of the Forgotten":
+        w_values = weapon_values
+    else:
+        w_values = weapon_values + [wp_cost]
+
+    passive_types = []
+    passive_values = []
+    for idx, (m, passive_type) in enumerate(real_passive_blocks):
+        start = m.end()
+        end = real_passive_blocks[idx + 1][0].start() if idx + 1 < len(real_passive_blocks) else len(compact)
+        section = compact[start:end]
+        passive_types.append(passive_type)
+        passive_values.append(_exact_number_values(section))
+
+    w_rarities, p_rarities = _exact_convert_values(wear, weapon_type, passive_types, w_values, passive_values)
+
+    parts = [animal.lower()]
+    if wear != "WORN":
+        parts.append(wear.lower())
+
+    parts.append(EXACT_WEAPONS[weapon_type]["alias"])
+    if w_rarities:
+        parts.append(",".join(map(str, w_rarities)))
+
+    for passive_type, rarity_values in zip(passive_types, p_rarities):
+        parts.append(EXACT_PASSIVES[passive_type]["alias"])
+        if rarity_values:
+            parts.append(",".join(map(str, rarity_values)))
+
+    return " ".join(p for p in parts if p).strip()
+def parse_boss_fallback(block):
     compact  = " ".join(block.split())
     warnings = []
     header   = re.search(r"##\s*Lvl\s*(\d+)\s+\w+\s+(.+?)(?=<:|###|-#|\*\*|$)", compact, re.I)
@@ -1072,6 +1400,23 @@ def parse_boss(block):
             passives.append(PASSIVE_MAP[key])
     passive_text = " " + " ".join(passives) if passives else ""
     return {"part": f"{level} {animal} {weapon}{passive_text}", "quality": quality, "warnings": warnings}
+
+def parse_boss(block):
+    try:
+        return {
+            "part": _parse_boss_exact(block),
+            "quality": 55.0,
+            "warnings": [],
+            "exact": True,
+        }
+    except Exception as exact_error:
+        fallback = parse_boss_fallback(block)
+        fallback["exact"] = False
+        fallback.setdefault("warnings", [])
+        fallback["warnings"].append(
+            "Exact parser fallback used: " + str(exact_error)
+        )
+        return fallback
 
 def normalize_hp(value):
     value = value.strip().lower().replace(",","")
@@ -1170,6 +1515,14 @@ def create_text_boss_section(parent, title, helper, next_label, next_action):
     sb = tk.Scrollbar(tf, command=tb.yview); sb.pack(side="right", fill="y")
     tb.configure(yscrollcommand=sb.set)
     af = tk.Frame(frame, bg=C("PANEL")); af.pack(fill="x", padx=10, pady=(0,8))
+    def _paste_into_box():
+        try:
+            clip = root.clipboard_get()
+            if clip:
+                tb.insert(tk.END, clip)
+        except Exception:
+            pass
+    make_btn(af, "Paste", _paste_into_box, "PANEL_2").pack(side="left", padx=(0,6))
     make_btn(af, "Clear Box", lambda: tb.delete("1.0", tk.END), "PANEL_2").pack(side="left")
     make_btn(af, next_label, next_action).pack(side="right")
     return tb
@@ -1279,7 +1632,7 @@ def build_ui(state=None):
              font=("Segoe UI",20,"bold")).pack(side="left")
     tk.Label(top, text=CREDIT_TEXT, bg=C("BG"), fg=C("MUTED"),
              font=("Segoe UI",9)).pack(side="left", padx=(10,0), pady=(6,0))
-    tk.Label(top, text="v0.6-portable", bg=C("PANEL_2"), fg=C("MUTED"),
+    tk.Label(top, text="v0.7-desktop", bg=C("PANEL_2"), fg=C("MUTED"),
              font=("Arial",9,"bold"), padx=10, pady=5).pack(side="right")
 
     # ── Notebook
@@ -1317,7 +1670,8 @@ def build_ui(state=None):
               "1. In Discord run wboss i, copy Boss 1 message → paste into Boss 1\n"
               "2. Click Next, copy Boss 2 → Boss 2, repeat for Boss 3\n"
               "3. Enter HP values (optional, leave blank for 80000)\n"
-              "4. Click Generate & Copy"),
+              "4. Click Generate & Copy\n"
+              "Exact blueprint/stat parser credit: Pencilvester."),
         bg=C("PANEL"), fg=C("MUTED"), justify="left", anchor="w", font=("Segoe UI",9)
     ).pack(fill="x", padx=12, pady=10)
 
@@ -1362,10 +1716,13 @@ def build_ui(state=None):
                 raise ValueError(f"Expected 3 bosses, found {len(blocks)}.\nPaste one boss per box.")
             bosses    = [parse_boss(b) for b in blocks]
             hp_values = [normalize_hp(e.get()) for e in [hp1, hp2, hp3]]
-            qe        = round(sum(b["quality"] for b in bosses)/3)
+            all_exact = all(b.get("exact") for b in bosses)
             command   = ("neon b myself vs " + ", ".join(b["part"] for b in bosses)
                          + " -hp " + " ".join(hp_values)
-                         + f" -m -qe{qe}")
+                         + " -m")
+            if not all_exact:
+                qe = round(sum(b["quality"] for b in bosses)/3)
+                command += f" -qe{qe}"
             _text_widgets["output"].delete("1.0", tk.END)
             _text_widgets["output"].insert(tk.END, command)
             warns = [w for b in bosses for w in b["warnings"]]
@@ -1675,7 +2032,7 @@ def build_ui(state=None):
 
         if not HAS_DND:
             tk.Label(isf,
-                text="ℹ  Local file drag-and-drop needs tkinterdnd2. Discord images usually work best with Copy Image → Ctrl+V.",
+                text="ℹ  Best flow: save/download the boss image first, then Browse Image. Discord drag/share can be unreliable.",
                 bg=C("BG"), fg=C("MUTED"), font=("Segoe UI",8)).pack(anchor="w", padx=12)
 
 def _im_generate_copy(status_label, auto=False):
